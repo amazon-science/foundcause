@@ -1,0 +1,6 @@
+# Pretrained weights are distributed as a GitHub Release asset, not via git
+# (they exceed GitHub's 100 MB file limit). See README.md.
+*.pt
+
+# macOS
+.DS_Store
