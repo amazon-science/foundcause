@@ -39,8 +39,14 @@ gh release download --repo amazon-science/foundcause --pattern checkpoint.pt
 python predict.py --data path/to/your_data.csv
 ```
 
-The CSV should have one row per observation and one column per variable. A
-header row is optional. Empty cells are treated as missing values. Columns with
+The CSV should have one row per observation and one column per variable. The
+delimiter (comma, semicolon, tab, pipe or space) is detected from the first line.
+A header row is optional: the first row is the header if any of its cells is not
+a number, or if it is exactly `0,1,2,...` (pandas' default header); any other
+header made only of numbers is read as data. Empty cells, `NA`,
+`NaN`, `?` and infinite values are treated as missing; every other cell must be a
+number, written with a decimal point rather than a comma (`TRUE`/`FALSE` are read
+as 1/0). Columns with
 fewer than max(10, 10% of the rows) observed values, constant columns and exact
 duplicates of another column are removed before inference and returned as
 isolated nodes (a duplicate gets the edges of the column it duplicates). Three
@@ -95,7 +101,7 @@ BibTeX:
 
 ## Note
 
-This code is being released solely for academic and scientific reproducibility purposes, in support of the methods and findings described in the associated publication. Pull requests are not being accepted in order to maintain the code exactly as it was used in the paper.
+This code is being released solely for academic and scientific reproducibility purposes, in support of the methods and findings described in the associated publication.
 
 ## License
 
