@@ -17,12 +17,11 @@ Usage:
 
     cfg = ModelConfig()
     model = CausalDiscoveryTransformer(cfg)
-    ckpt = torch.load("checkpoint.pt", map_location="cpu", weights_only=False)
-    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
-    model.load_state_dict(state, strict=False)
+    ckpt = torch.load("checkpoint.pt", map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt["model_state_dict"], strict=True)
     model.eval()
 
-    # X: numpy array (N, D), N samples, D variables (2 <= D <= 100)
+    # X: numpy array (N, D), N samples, D variables (2 <= D <= 100), NaN = missing
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     result = predict(model, X, device)
@@ -37,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
 
 class ModelConfig:
@@ -124,6 +124,17 @@ class AttentionBlock(nn.Module):
                 attn_mask = sb.masked_fill(~attn_mask.expand_as(sb), -1e9)
             else:
                 attn_mask = sb
+        # Fused SDPA kernels on some GPUs require the attention-mask row stride to be a
+        # multiple of 4: pad the key dimension with masked-out slots (output unchanged).
+        if attn_mask is not None:
+            pad = (-attn_mask.shape[-1]) % 4
+            if pad:
+                k = F.pad(k, (0, 0, 0, pad))
+                v = F.pad(v, (0, 0, 0, pad))
+                if attn_mask.dtype == torch.bool:
+                    attn_mask = F.pad(attn_mask, (0, pad), value=False)
+                else:
+                    attn_mask = F.pad(attn_mask, (0, pad), value=-1e9)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         z = z + self.out_proj(out.transpose(1, 2).reshape(B, S, D))
         z = z + self.ffn(self.ln_ffn(z))
@@ -195,6 +206,12 @@ class PMAPooling(nn.Module):
         k_proj, v_proj = kv.unbind(0)  # each (B*D, heads, N, h)
         # Boolean mask: True = attend (invert kpm where True = ignore)
         attn_mask = (~kpm).unsqueeze(1).unsqueeze(1)  # (B*D, 1, 1, N) bool
+        pad = (-attn_mask.shape[-1]) % 4
+        if pad:
+            # Mask stride alignment for fused SDPA kernels (see AttentionBlock)
+            k_proj = F.pad(k_proj, (0, 0, 0, pad))
+            v_proj = F.pad(v_proj, (0, 0, 0, pad))
+            attn_mask = F.pad(attn_mask, (0, pad), value=False)
         attn_out = F.scaled_dot_product_attention(q_proj, k_proj, v_proj, attn_mask=attn_mask)
         pma_out = self.out_proj_attn(attn_out.transpose(1, 2).reshape(B * D, K, H))  # (B*D, K, H)
         pma_out = pma_out + self.ffn(pma_out)  # (B*D, K, H)
@@ -210,6 +227,10 @@ class PMAPooling(nn.Module):
 
         # Zero padded variables
         out = out * var_mask.unsqueeze(-1)
+        # Zero variables without any observed sample (e.g. an all-NaN column), like padding;
+        # otherwise the -1e4 max-pool fill leaks into the embedding
+        has_obs = mask.bool().any(dim=1)  # (B, D)
+        out = torch.where(has_obs.unsqueeze(-1), out, torch.zeros_like(out))
         # Diversity loss (computed here to avoid state mutation that breaks torch.compile)
         q_norm = F.normalize(pma_out.reshape(B, D, K, H), dim=-1)
         cos_sim = torch.bmm(
@@ -561,8 +582,17 @@ class PairwiseStatistics(nn.Module):
                   dist2_d = diff_d ** 2
                   pm = oc.unsqueeze(2) * oc.unsqueeze(1)
                   dist2_d = dist2_d + (1 - pm) * 1e10 + eye_n * 1e10
-                  sigma2_nw[:, d0:d1] = dist2_d.permute(0, 3, 1, 2).reshape(
-                      B, d1 - d0, N * N).median(dim=-1).values.clamp(min=0.01, max=100)
+                  # Median over observed off-diagonal pairs only: the +1e10 entries
+                  # (unobserved / diagonal) are the largest, so take the k-th smallest
+                  # value with k = median index of the valid pairs (a plain median lands
+                  # in the padding when values are missing)
+                  dist_flat = dist2_d.reshape(B, N * N, d1 - d0)  # view, no copy
+                  n_obs_bw = oc.sum(dim=1)  # (B, d1-d0)
+                  n_valid_bw = (n_obs_bw * n_obs_bw - n_obs_bw).clamp(min=1)  # off-diag observed pairs
+                  med_idx = ((n_valid_bw - 1) / 2).long().clamp(min=0, max=N * N - 1)
+                  sigma2_nw[:, d0:d1] = torch.stack([torch.stack([
+                      dist_flat[b, :, v].kthvalue(int(med_idx[b, v]) + 1).values
+                      for v in range(d1 - d0)]) for b in range(B)]).clamp(min=0.01, max=100)
 
               # NW regression residuals + HSIC on residuals
               nw_resid_var_ij = torch.zeros(B, D, D, device=x.device)
@@ -603,7 +633,12 @@ class PairwiseStatistics(nn.Module):
                   K_sum_per = K.sum(dim=2).clamp(min=1e-8)  # (B, N, n_c)
                   stein_diag = (K * stein_weights).sum(dim=2) / K_sum_per  # (B, N, n_c)
                   stein_diag = stein_diag.clamp(-1000, 1000)
-                  stein_diag_var[:, i_start:i_end] = stein_diag.var(dim=1).clamp(0, 50)
+                  # Variance over observed rows only (missing rows are 0 and would dilute it)
+                  n_o_st = obs_i.sum(dim=1).clamp(min=1)  # (B, n_c)
+                  st_mean = (stein_diag * obs_i).sum(dim=1) / n_o_st
+                  st_var = (((stein_diag - st_mean.unsqueeze(1)) * obs_i) ** 2).sum(dim=1) \
+                      / (n_o_st - 1).clamp(min=1)
+                  stein_diag_var[:, i_start:i_end] = st_var.clamp(0, 50)
 
                   resid = x_f32.unsqueeze(1) - f_hat
                   jmask = (obs_i.unsqueeze(-1) * obs_f32.unsqueeze(2)).permute(0, 2, 1, 3)
@@ -740,6 +775,9 @@ class PairwiseStatistics(nn.Module):
             with torch.amp.autocast(device_type=x_val.device.type, enabled=False):
               x_igci = x.float()
               obs_bool = obs.bool()
+              # Tie-breaking jitter: on discrete data, ties would otherwise get ranks by
+              # sample order and make the CDF slopes (and IGCI) noise
+              x_igci = x_igci + torch.randn_like(x_igci) * 1e-7 * obs.float()
 
               # CDF transform: rank/n_obs per variable (IGCI requires uniform reference measure)
               x_igci_cdf = torch.zeros_like(x_igci)
@@ -1011,28 +1049,45 @@ class PairwiseStatistics(nn.Module):
             # Never dropped by feature dropout (see Encoder stat_bias path).
 
             # 41. Log condition number proxy: log(max_diag_prec / min_diag_prec)
-            diag_prec_rel = prec.diagonal(dim1=-2, dim2=-1)  # (B, D)
-            diag_prec_valid = diag_prec_rel.abs() * var_mask + (1 - var_mask)  # padded -> 1.0
-            max_diag = diag_prec_valid.max(dim=-1, keepdim=True).values  # (B, 1)
-            min_diag = diag_prec_valid.min(dim=-1, keepdim=True).values.clamp(min=1e-6)  # (B, 1)
-            log_cond = torch.log(max_diag / min_diag).clamp(-10, 10).unsqueeze(1).expand(-1, D, D)  # (B, D, D)
+            # Extrema over real (non-padded) variables only
+            d_real = var_mask.sum(dim=1)  # (B,)
+            pad_b = ~var_mask.bool()  # (B, D) True=padded
+            diag_prec_rel = prec.diagonal(dim1=-2, dim2=-1).abs()  # (B, D)
+            max_diag = diag_prec_rel.masked_fill(pad_b, float('-inf')).max(dim=-1, keepdim=True).values.clamp(min=1e-6)  # (B, 1)
+            min_diag = diag_prec_rel.masked_fill(pad_b, float('inf')).min(dim=-1, keepdim=True).values.clamp(min=1e-6)  # (B, 1)
+            log_cond = torch.log(max_diag / min_diag).clamp(-10, 10)  # (B, 1)
+            log_cond = torch.where(d_real.unsqueeze(-1) >= 2, log_cond,
+                                   torch.zeros_like(log_cond))  # guard d_real<2
+            log_cond = log_cond.unsqueeze(1).expand(-1, D, D)  # (B, D, D)
 
-            # 42. Dimension/sample ratio: D / mean(obs_count)
-            mean_n = joint_count.mean(dim=(1, 2)).clamp(min=1)  # (B,)
-            d_over_n = (D_cur / mean_n).clamp(0, 1).unsqueeze(1).unsqueeze(2).expand(-1, D, D)  # (B, D, D)
+            # 42. Dimension/sample ratio: d_real / mean observed samples per real variable
+            # (mean over real variables with >= 1 observation; padding does not dilute n)
+            raw_obs_n = obs.sum(dim=1)  # (B, D) unclamped observation counts
+            has_obs_var = (raw_obs_n >= 1).float() * var_mask  # real vars with >=1 obs
+            mean_obs_n = ((raw_obs_n * has_obs_var).sum(dim=1)
+                          / has_obs_var.sum(dim=1).clamp(min=1)).clamp(min=1)  # (B,)
+            d_over_n = (d_real / mean_obs_n).clamp(0, 1).unsqueeze(1).unsqueeze(2).expand(-1, D, D)  # (B, D, D)
 
             # 43. Unique ratio per variable: std/range proxy — uniform ~0.29, binary near 0
-            x_range = x_val.max(dim=1).values - x_val.min(dim=1).values  # (B, D)
-            x_std = x_val.std(dim=1)  # (B, D)
+            # Max/min/std over observed entries only
+            obs_b = obs.bool()  # (B, N, D)
+            x_max = x_val.masked_fill(~obs_b, float('-inf')).max(dim=1).values  # (B, D)
+            x_min = x_val.masked_fill(~obs_b, float('inf')).min(dim=1).values  # (B, D)
+            x_range = x_max - x_min  # (B, D)
+            x_mean_obs = (x_val * obs).sum(dim=1) / obs_count_per_var  # (B, D)
+            x_dev2 = (((x_val - x_mean_obs.unsqueeze(1)) * obs) ** 2).sum(dim=1)  # (B, D)
+            x_std = (x_dev2 / (obs_count_per_var - 1).clamp(min=1)).clamp(min=0).sqrt()  # (B, D)
             unique_proxy = (x_std / x_range.clamp(min=1e-8)).clamp(0, 1)  # (B, D)
+            unique_proxy = torch.where(obs_count_per_var >= 2, unique_proxy,
+                                       torch.zeros_like(unique_proxy))  # guard n_obs<2
             unique_proxy = unique_proxy * var_mask  # zero for padded
             unique_i = unique_proxy.unsqueeze(2).expand(-1, -1, D)  # (B, D, D)
             unique_j = unique_proxy.unsqueeze(1).expand(-1, D, -1)  # (B, D, D)
             unique_ratio = torch.minimum(unique_i, unique_j)  # (B, D, D)
 
-            # 44. Normalized observation count per pair
-            max_possible = x_val.shape[1]  # N (samples)
-            norm_obs = (joint_count / max(max_possible, 1)).clamp(0, 1)  # (B, D, D)
+            # 44. Normalized observation count on an absolute log scale (independent of padding)
+            norm_obs = (torch.log1p(mean_obs_n) / float(np.log1p(10000.0))).clamp(0, 1)
+            norm_obs = norm_obs.unsqueeze(1).unsqueeze(2).expand(-1, D, D)  # (B, D, D)
 
             # Append reliability features (indices 41-44)
             reliability = torch.stack([log_cond, d_over_n, unique_ratio, norm_obs], dim=-1)  # (B, D, D, 4)
@@ -1543,57 +1598,8 @@ class CausalDiscoveryTransformer(nn.Module):
                 'skel_logit': self._learned_skel(edge_logits) if self.tri_refine is not None else None}
 
 
-def _gmm_threshold(D_pred, d):
-    """Fit 2-component GMM to logit distribution, find adaptive threshold.
-
-    Uses skeleton scores (max of each directed pair) in logit space for
-    better separation between edge/non-edge clusters. Falls back to 0.5
-    if too few pairs or components are not well-separated.
-    """
-    from sklearn.mixture import GaussianMixture
-    # Collect unique skeleton scores (upper triangle)
-    skel_logits = []
-    for i in range(d):
-        for j in range(i + 1, d):
-            s = max(D_pred[i, j], D_pred[j, i])
-            s = np.clip(s, 1e-6, 1 - 1e-6)
-            skel_logits.append(np.log(s / (1 - s)))
-    skel_logits = np.array(skel_logits)
-
-    if len(skel_logits) < 4:  # too few pairs for GMM
-        return 0.5
-
-    gmm = GaussianMixture(n_components=2, random_state=42, max_iter=100)
-    try:
-        gmm.fit(skel_logits.reshape(-1, 1))
-    except Exception:
-        return 0.5  # GMM convergence failure — fall back to default
-
-    means = gmm.means_.flatten()
-    stds = np.sqrt(gmm.covariances_.flatten())
-
-    # Check if components are well-separated
-    idx_low = 0 if means[0] < means[1] else 1
-    idx_high = 1 - idx_low
-    separation = abs(means[idx_high] - means[idx_low])
-
-    if separation < 1.0:  # not well-separated, fall back
-        return 0.5
-
-    # Find crossing point (weighted midpoint by stds)
-    mu_low, mu_high = means[idx_low], means[idx_high]
-    s_low, s_high = stds[idx_low], stds[idx_high]
-    cross_logit = (mu_low * s_high + mu_high * s_low) / (s_low + s_high)
-
-    # Convert back to probability
-    threshold = 1.0 / (1.0 + np.exp(-cross_logit))
-    # Clamp to reasonable range
-    threshold = np.clip(threshold, 0.1, 0.9)
-    return float(threshold)
-
-
 def predict(model, X, device, temperature=1.0, n_runs=10, max_samples=5000,
-            min_agreement=0.5, threshold=None, optimizer=None):
+            min_agreement=0.5, threshold=0.5, sanitize=True):
     """Predict causal graph from observational data.
 
     Uses torch.inference_mode() for gradient tracking. Callers should set
@@ -1603,26 +1609,34 @@ def predict(model, X, device, temperature=1.0, n_runs=10, max_samples=5000,
 
     Args:
         model: trained CausalDiscoveryTransformer (can be DDP-wrapped)
-        X: numpy array of shape (n_samples, d_variables)
+        X: numpy array of shape (n_samples, d_variables), NaN = missing
         device: torch device
         temperature: calibration temperature (default 1.0)
-        n_runs: number of permutation-averaged forward passes (default 10)
-        max_samples: max observations to use (default 5000)
-        min_agreement: fraction of runs that must agree on an edge (default 0.5)
-        threshold: fixed threshold override. If None, uses adaptive GMM threshold.
-        optimizer: Schedule-Free optimizer (needs .eval()/.train() for correct weights).
+        n_runs: number of permutation-averaged forward passes (default 10).
+            When n > 50, each run also uses a random subset of
+            ceil(0.9 * min(n, max_samples)) rows (without replacement).
+        max_samples: max observations to use per run (default 5000)
+        min_agreement: fraction of runs that must find an edge, in either
+            direction (default 0.5)
+        threshold: edge threshold on max(P_ij, P_ji) (default 0.5; None also means 0.5)
+        sanitize: if True (default), columns with fewer than max(10, 0.1 * n)
+            observed values, constant columns and exact duplicate columns are
+            removed before inference and returned as isolated nodes; a duplicate
+            gets the rows/columns of the column it duplicates (no edge between them)
 
     Returns:
         dict with keys:
             'adjacency': binary numpy array (d, d) -- predicted DAG
             'probabilities': float numpy array (d, d) -- edge probabilities
+            'C': float numpy array (d, d) -- hidden-confounder scores averaged
+                 across runs, symmetric, zero diagonal
             'threshold': float -- threshold used
-            'agreement': float numpy array (d, d) -- per-edge agreement rate across runs
+            'agreement': float numpy array (d, d) -- per-pair agreement rate across runs
+            'dropped': list of column indices removed by the sanitization
+            'duplicates': {duplicate column: column it duplicates}
     """
     # Unwrap DDP if needed
     raw_model = model.module if hasattr(model, 'module') else model
-    if optimizer is not None:
-        optimizer.eval()
     use_amp = device.type == 'cuda'
 
     X = np.asarray(X, dtype=np.float32)
@@ -1630,34 +1644,81 @@ def predict(model, X, device, temperature=1.0, n_runs=10, max_samples=5000,
         raise ValueError(f"X must be 2D (samples, variables), got shape {X.shape}")
     n_orig, d = X.shape
     if d < 2:
-        import warnings
         warnings.warn(f"Need >= 2 variables for causal discovery, got d={d}")
-        return {'adjacency': np.zeros((d, d)), 'probabilities': np.zeros((d, d)),
-                'threshold': 0.5, 'agreement': np.zeros((d, d))}
+        return {'adjacency': np.zeros((d, d)), 'probabilities': np.zeros((d, d)), 'C': np.zeros((d, d)),
+                'threshold': 0.5, 'agreement': np.zeros((d, d)), 'dropped': [], 'duplicates': {}}
     if n_orig < 2:
-        import warnings
         warnings.warn(f"Need >= 2 samples, got n={n_orig}")
-        return {'adjacency': np.zeros((d, d)), 'probabilities': np.zeros((d, d)),
-                'threshold': 0.5, 'agreement': np.zeros((d, d))}
+        return {'adjacency': np.zeros((d, d)), 'probabilities': np.zeros((d, d)), 'C': np.zeros((d, d)),
+                'threshold': 0.5, 'agreement': np.zeros((d, d)), 'dropped': [], 'duplicates': {}}
     if d > 51:
-        import warnings
         warnings.warn(f"Model trained on d<=51, got d={d}. Results may be unreliable and slow.")
 
-    # Subsample rows if n > max_samples
-    if n_orig > max_samples:
-        rng_sub = np.random.RandomState(42)
-        idx = rng_sub.choice(n_orig, max_samples, replace=False)
-        X_use = X[idx]
-    else:
-        X_use = X
+    # Column sanitization (see `sanitize`), then inference on the kept columns
+    if sanitize:
+        obs = ~np.isnan(X)
+        n_obs = obs.sum(0)
+        keep = n_obs >= max(10, 0.1 * n_orig)
+        # exact test on observed values (a float32 constant can have variance ~1e-16)
+        const = np.array([n_obs[j] == 0 or bool(np.all(X[obs[:, j], j] == X[obs[:, j], j][0])) for j in range(d)])
+        keep &= ~const
+        rep = {}  # representative column -> list of exact duplicates
+        for j in np.flatnonzero(keep):
+            for r in rep:
+                if np.array_equal(X[:, j], X[:, r], equal_nan=True):
+                    keep[j] = False
+                    rep[r].append(j)
+                    break
+            else:
+                rep[j] = []
+        if not keep.all():
+            dropped = np.flatnonzero(~keep).tolist()
+            warnings.warn(f"predict: {len(dropped)} column(s) removed (sparse/constant/duplicate): {dropped}")
+            idx = np.flatnonzero(keep)
+            out = {k: np.zeros((d, d)) for k in ('adjacency', 'probabilities', 'C', 'agreement')}
+            out['threshold'] = 0.5 if threshold is None else float(threshold)
+            if len(idx) >= 2:
+                sub = predict(model, X[:, idx], device, temperature=temperature, n_runs=n_runs,
+                              max_samples=max_samples, min_agreement=min_agreement,
+                              threshold=threshold, sanitize=False)
+                for k in ('adjacency', 'probabilities', 'C', 'agreement'):
+                    out[k][np.ix_(idx, idx)] = sub[k]
+                out['threshold'] = sub['threshold']
+            for r, twins in rep.items():
+                for t in twins:  # a duplicate gets its representative's rows/cols; no edge between them
+                    for k in ('adjacency', 'probabilities', 'C', 'agreement'):
+                        out[k][t, :] = out[k][r, :]
+                        out[k][:, t] = out[k][:, r]
+                        out[k][t, r] = out[k][r, t] = 0.0
+                        out[k][t, t] = 0.0
+            out['dropped'] = dropped
+            out['duplicates'] = {int(t): int(r) for r, twins in rep.items() for t in twins}
+            return out
 
-    # K-runs loop with column permutation for robustness
+    # Per-run row subsampling without replacement (duplicate rows would distort rank
+    # statistics); small datasets use all rows (up to max_samples) in every run
+    n_take = int(np.ceil(0.9 * min(n_orig, max_samples))) if n_orig > 50 else min(n_orig, max_samples)
+
+    # K-runs loop with row subsampling + column permutation for robustness
     D_accum = np.zeros((d, d))
+    C_accum = np.zeros((d, d))
     D_runs_raw = []  # list of (d, d) probability arrays for post-hoc agreement
 
-    with torch.inference_mode():
+    # Each run seeds torch as well (the IGCI tie-break jitter draws from the torch RNG), so
+    # results are deterministic. Only the CPU generator and, for CUDA inference, the model's
+    # device are seeded; fork_rng restores their state afterwards (CPU runs never touch CUDA)
+    fork_devices = [device] if device.type == 'cuda' else []
+    with torch.random.fork_rng(devices=fork_devices), torch.inference_mode():
         for run_i in range(n_runs):
             rng_eval = np.random.RandomState(42 + run_i)
+            torch.default_generator.manual_seed(42 + run_i)
+            if fork_devices:
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(42 + run_i)
+            if n_take < n_orig:
+                X_use = X[rng_eval.choice(n_orig, n_take, replace=False)]
+            else:
+                X_use = X
             # Random column permutation
             col_perm = rng_eval.permutation(d)
             X_perm = X_use[:, col_perm]
@@ -1679,36 +1740,31 @@ def predict(model, X, device, temperature=1.0, n_runs=10, max_samples=5000,
 
             # Temperature-scale the logits
             D_run = torch.sigmoid(out['edge_logits'][0, :d, :d] / temperature).cpu().numpy()
+            C_run = out['C'][0, :d, :d].float().cpu().numpy()
 
             # Un-permute back to original variable ordering
             inv_perm = np.argsort(col_perm)
             D_unperm = D_run[np.ix_(inv_perm, inv_perm)]
             D_accum += D_unperm
+            C_accum += C_run[np.ix_(inv_perm, inv_perm)]
             D_runs_raw.append(D_unperm)
 
         # Average probabilities
         D_pred = D_accum / n_runs
+        # Averaged confounder scores: symmetric, zero diagonal
+        C_pred = C_accum / n_runs
+        C_pred = 0.5 * (C_pred + C_pred.T)
+        np.fill_diagonal(C_pred, 0.0)
 
-        # Determine threshold: GMM adaptive or fixed override
-        if threshold is None:
-            threshold_used = _gmm_threshold(D_pred, d)
-        else:
-            threshold_used = float(threshold)
+        threshold_used = 0.5 if threshold is None else float(threshold)
 
-        # Compute per-run agreement using the actual threshold (not hardcoded 0.5)
-        D_runs_bin = []
+        # Per-pair agreement across runs: a run agrees on (i, j) if it finds the edge
+        # in either direction (direction flips do not count as disagreement)
+        agreement = np.zeros((d, d))
         for D_run_prob in D_runs_raw:
-            D_run_bin = np.zeros((d, d))
-            for i in range(d):
-                for j in range(i + 1, d):
-                    s = max(D_run_prob[i, j], D_run_prob[j, i])
-                    if s > threshold_used:
-                        if D_run_prob[i, j] >= D_run_prob[j, i]:
-                            D_run_bin[i, j] = 1.0
-                        else:
-                            D_run_bin[j, i] = 1.0
-            D_runs_bin.append(D_run_bin)
-        agreement = np.mean(D_runs_bin, axis=0)  # (d, d), values in [0, 1]
+            agreement += (np.maximum(D_run_prob, D_run_prob.T) > threshold_used)
+        agreement /= max(len(D_runs_raw), 1)
+        np.fill_diagonal(agreement, 0.0)
 
         # Two-stage edge recovery: existence by max, direction by argmax
         D_pred_bin = np.zeros((d, d))
@@ -1727,12 +1783,12 @@ def predict(model, X, device, temperature=1.0, n_runs=10, max_samples=5000,
                 if D_pred_bin[i, j] > 0 and agreement[i, j] < min_agreement:
                     D_pred_bin[i, j] = 0
 
-    if optimizer is not None:
-        optimizer.train()
-
     return {
         'adjacency': D_pred_bin,
         'probabilities': D_pred,
+        'C': C_pred,
         'threshold': threshold_used,
         'agreement': agreement,
+        'dropped': [],
+        'duplicates': {},
     }
